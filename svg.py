@@ -5,15 +5,14 @@ from keras.layers import Input
 import keras.backend as K
 
 
-class DDPG(object):
-    def __init__(self, epoch, net, env_spec, replay_buffer, es, batch_size=32, min_buffer_size=10000, max_path_length=200,
+class SVG(object):
+    def __init__(self, epoch, net, env_spec, replay_buffer, batch_size=32, min_buffer_size=10000, max_path_length=200,
             pi_opimizer=None, q_optimizer=None, pi_lr=1e-3, q_lr=1e-4, sess=None, tau=0.001, gamma=0.99, scale_reward=1.0,
             env=None, noise_fn=None, num_episodes_per_epoch=1, num_critic_update=1, num_policy_update=1, num_update_per_sample=1):
         self.epoch = epoch
         self.net = net
         self.env_spec = env_spec
         self.replay_buffer = replay_buffer
-        self.es = es
         self.batch_size = batch_size
         self.min_buffer_size = min_buffer_size
         self.max_path_length = max_path_length
@@ -44,28 +43,35 @@ class DDPG(object):
 
     def build(self):
         model = self.net.model
-        pi_model = self.net.pi_model
+        mu_model = self.net.mu_model
+        log_std_model = self.net.log_std_model
         q_model = self.net.q_model
         target_model = self.net.target_model
-        target_pi_model = self.net.target_pi_model
+        target_mu_model = self.net.target_mu_model
+        target_log_std_model = self.net.target_log_std_model
         target_q_model = self.net.target_q_model
 
         self.states = tf.placeholder(tf.float32, shape=(None, self.in_dim), name='states')
         self.actions = tf.placeholder(tf.float32, shape=[None, self.action_dim], name='actions')
         self.rewards = tf.placeholder(tf.float32, shape=[None], name='rewards')
         self.next_states = tf.placeholder(tf.float32, shape=[None, self.in_dim], name='next_states')
-        # terminal contain only 0 or 1 it will work as masking
-        #self.terminals = tf.placeholder(tf.bool, shape=[None], name='terminals')
         self.ys = tf.placeholder(tf.float32, shape=[None])
 
-        #y = tf.where(self.terminals, self.rewards, self.rewards + self.gamma * K.stop_gradient(K.sum(target_q_model(Concatenate()([target_model(self.next_states),
-        #    target_pi_model(self.next_states)])), axis=-1)))
-        self.target_q = K.sum(target_q_model(Concatenate()([target_model(self.states), target_pi_model(self.states)])), axis=-1)
+        # There are other implementations about how can we take aciton.
+        # Taking next action version or using only mu version or searching action which maximize Q.
+        target_mu = target_mu_model(self.states)
+        target_log_std = target_log_std_model(self.states)
+        target_action = target_mu + K.random_normal(K.shape(target_mu), dtype=tf.float32) * K.exp(target_log_std)
+        self.target_q = K.sum(target_q_model(Concatenate()([target_model(self.states), target_action])), axis=-1)
+
         self.q = K.sum(q_model(Concatenate()([model(self.states), self.actions])), axis=-1)
         self.q_loss = K.mean(K.square(self.ys-self.q))
 
-        self.mu = pi_model(self.states)
-        self.pi_loss = - K.mean(q_model(Concatenate()([model(self.states), self.mu])))
+        self.mu = mu_model(self.states)
+        self.log_std = log_std_model(self.states)
+        self.eta = (self.actions - self.mu) / K.exp(self.log_std)
+        inferred_action = self.mu + K.stop_gradient(self.eta) * K.exp(self.log_std)
+        self.pi_loss = - K.mean(q_model(Concatenate()([model(self.states), inferred_action])))
 
         self.q_updater = self.q_optimizer.minimize(self.q_loss, var_list=self.net.var_q)
         self.pi_updater = self.pi_opimizer.minimize(self.pi_loss, var_list=self.net.var_pi)
@@ -81,20 +87,24 @@ class DDPG(object):
             self.build()
         next_q = self.sess.run(self.target_q, {self.states: batch['next_states'], K.learning_phase(): 1})
         ys = batch['rewards'] + (1 - batch['terminals']) * next_q
-        feed_in = {self.states: batch['states'],
+        feed_in = {
+                self.states: batch['states'],
                 self.actions: batch['actions'],
                 self.rewards: batch['rewards'],
                 self.next_states: batch['next_states'],
-                #self.terminals: batch['terminals'], # inverse 0 and 1
                 self.ys: ys,
-                K.learning_phase(): 1}
+                K.learning_phase(): 1
+                }
         self.sess.run(self.q_updater, feed_in)
 
     def optimize_pi(self, batch):
         if not self.built:
             self.build()
-        feed_in = {self.states: batch['states'],
-                K.learning_phase(): 1}
+        feed_in = {
+                self.states: batch['states'],
+                self.actions: batch['actions'],
+                K.learning_phase(): 1
+                }
         self.sess.run(self.pi_updater, feed_in)
 
     def rollout(self, max_path_length=None):
@@ -133,9 +143,10 @@ class DDPG(object):
 
     def get_action(self, state):
         mu = self.sess.run(self.mu, {self.states: [state], K.learning_phase(): 0})[0]
-        a = mu + self.es.evolve_state()
+        log_std = self.sess.run(self.log_std, {self.states: [state], K.learning_phase(): 0})[0]
+        a = mu + np.random.normal(size=mu.shape) * np.exp(log_std)
         a = np.clip(a, self.env_spec.get('action_space').low, self.env_spec.get('action_space').high)
-        return a, dict(mu=mu)
+        return a, dict(mu=mu, log_std=log_std)
 
     def train_episode(self):
         if not self.built:
@@ -161,7 +172,6 @@ class DDPG(object):
         train_start = False
         for i in range(self.epoch):
             s = self.env.reset()
-            self.es.reset()
             total_reward = 0
             terminal = False
             max_path_length = self.max_path_length
@@ -185,4 +195,5 @@ class DDPG(object):
                             self.optimize_pi(batch)
                 self.sess.run(self.soft_updater)
             print('Total reward: ', total_reward)
+
 
