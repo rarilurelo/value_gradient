@@ -71,9 +71,9 @@ class SoftQ(object):
         # target_v_from_pi: (batch)
         self.target_v_from_pi = K.sum(self.entropy_alpha * K.log(K.mean(K.exp(1/self.entropy_alpha * Q) / prob_density, axis=0)), axis=-1)
 
-        # action space may be -1 ~ +1
-        sampled_action_for_v = K.random_uniform(shape_for_v, minval=-1, maxval=1, dtype=tf.float32)
-        prob_density = K.ones_like(sampled_action_for_v) * 0.5
+        # action space may be -10 ~ +10
+        sampled_action_for_v = K.random_uniform(shape_for_v, minval=-10, maxval=10, dtype=tf.float32)
+        prob_density = K.ones_like(sampled_action_for_v) / 20
         Q = target_q_model(Concatenate()([K.permute_dimensions(K.repeat(target_model(self.states), self.K_v), (1, 0, 2)), sampled_action_for_v]))
         self.target_v_from_uniform = K.sum(self.entropy_alpha * K.log(K.mean(K.exp(1/self.entropy_alpha * Q) / prob_density, axis=0)), axis=-1)
 
@@ -93,17 +93,17 @@ class SoftQ(object):
         tile_for_K = K.tile(K.expand_dims(sampled_action_for_K, 0), [self.M_pi, 1, 1, 1])
         # tile_for_M: (K, M, batch, action)
         tile_for_M = K.tile(K.expand_dims(self.sampled_action_feeder, 0), [self.K_pi, 1, 1, 1])
-        # kappa: (K, M, batch, action)
-        kappa = K.exp(-1/self.h * K.sum((tile_for_M - K.permute_dimensions(tile_for_K, (1, 0, 2, 3)))**2, axis=2))
-        # grad_kappa: (K, batch, action)
-        grad_kappa = K.gradients(kappa, sampled_action_for_K)[0]
+        # kappa: (K, M, batch, 1)
+        kappa = K.exp(-1/self.h * K.sum((tile_for_M - K.permute_dimensions(tile_for_K, (1, 0, 2, 3)))**2, axis=3, keepdims=True))
+        # grad_kappa: (K, M, batch, action)
+        grad_kappa = -2/self.h * (tile_for_M - K.permute_dimensions(tile_for_K, (1, 0, 2, 3))) * \
+                K.exp(-1/self.h * K.sum((tile_for_M - K.permute_dimensions(tile_for_K, (1, 0, 2, 3)))**2, axis=3, keepdims=True))
         # _Q: (M, batch, 1)
         _Q = q_model(Concatenate()([K.permute_dimensions(K.repeat(model(self.states), self.M_pi), (1, 0, 2)), self.sampled_action_for_M]))
         # grad_Q: (M, batch, action)
         grad_Q = K.gradients(_Q, self.sampled_action_for_M)[0]
-        # delta_f: (K, M, batch, action)
-        delta_f = K.mean(kappa*grad_Q + K.expand_dims(grad_kappa, 1), axis=0)
-        delta_f = K.stop_gradient(K.mean(delta_f, axis=1))
+        # delta_f: (K, M, batch, action) -> (K, batch, action)
+        delta_f = K.stop_gradient(K.mean(kappa*grad_Q + grad_kappa, axis=1))
         self.pi_loss = K.mean(delta_f * sampled_action_for_K)
 
         self.q_updater = self.q_optimizer.minimize(self.q_loss, var_list=self.net.var_q)
